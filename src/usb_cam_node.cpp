@@ -101,7 +101,6 @@ UsbCamNode::~UsbCamNode()
   m_camera_info_msg.reset();
   m_camera_info.reset();
   m_timer.reset();
-  m_publish_timer.reset();
   m_service_capture.reset();
   m_parameters_callback_handle.reset();
 
@@ -220,26 +219,18 @@ void UsbCamNode::init()
   // start the camera
   m_camera->start();
 
-  auto frame_rate = m_camera->get_frame_rate();
-  if (static_cast<size_t>(m_parameters.framerate) > frame_rate) {
-    RCLCPP_WARN_STREAM(
-      this->get_logger(),
-      "Desired framerate " << m_parameters.framerate << " is higher than the camera's capability " <<
-        frame_rate << " fps");
-    m_parameters.framerate = frame_rate;
-  }
-
-  // TODO(lucasw) should this check a little faster than expected frame rate?
-  // TODO(lucasw) how to do small than ms, or fractional ms- std::chrono::nanoseconds?
-  const int period_ms = 1000.0 / frame_rate;
+  // Match the requested capture cadence directly.
+  //
+  // Note: publishing is performed immediately after a frame is captured in
+  // take_and_send_image()/take_and_send_image_mjpeg() rather than from a
+  // separate publish timer. On some platforms/cameras, decoupling capture and
+  // publish into different timers can significantly reduce the effective topic
+  // output rate even when the camera itself is configured for a higher FPS.
+  const int period_ms = 1000.0 / m_parameters.framerate;
   m_timer = this->create_wall_timer(
     std::chrono::milliseconds(static_cast<int64_t>(period_ms)),
     std::bind(&UsbCamNode::update, this));
   RCLCPP_INFO_STREAM(this->get_logger(), "Timer triggering every " << period_ms << " ms");
-  const int publish_period_ms = 1000.0 / m_parameters.framerate;
-  m_publish_timer = this->create_wall_timer(
-    std::chrono::milliseconds(static_cast<int64_t>(publish_period_ms)),
-    std::bind(&UsbCamNode::publish, this));
 }
 
 void UsbCamNode::get_params()
@@ -405,6 +396,10 @@ bool UsbCamNode::take_and_send_image()
 
   *m_camera_info_msg = m_camera_info->getCameraInfo();
   m_camera_info_msg->header = m_image_msg->header;
+
+  // Publish immediately after capture so the output cadence follows the actual
+  // frame acquisition cadence instead of a second timer.
+  m_image_publisher->publish(*m_image_msg, *m_camera_info_msg);
   return true;
 }
 
@@ -425,6 +420,11 @@ bool UsbCamNode::take_and_send_image_mjpeg()
 
   *m_camera_info_msg = m_camera_info->getCameraInfo();
   m_camera_info_msg->header = m_compressed_img_msg->header;
+
+  // Keep compressed output in the same capture/publish path for consistent
+  // timing behavior with the raw image path.
+  m_compressed_image_publisher->publish(*m_compressed_img_msg);
+  m_compressed_cam_info_publisher->publish(*m_camera_info_msg);
 
   return true;
 }
@@ -454,16 +454,6 @@ void UsbCamNode::update()
     if (!isSuccessful) {
       RCLCPP_WARN_ONCE(this->get_logger(), "USB camera did not respond in time.");
     }
-  }
-}
-
-void UsbCamNode::publish()
-{
-  if (m_parameters.pixel_format_name == "mjpeg") {
-    m_compressed_image_publisher->publish(*m_compressed_img_msg);
-    m_compressed_cam_info_publisher->publish(*m_camera_info_msg);
-  } else {
-    m_image_publisher->publish(*m_image_msg, *m_camera_info_msg);
   }
 }
 }  // namespace usb_cam
